@@ -1,43 +1,113 @@
-# .github/workflows/main.yml
 name: CI-ML-Pipeline
-
+ 
 on:
   push:
     branches: [ main ]
+  pull_request:
+    branches: [ main ]
   workflow_dispatch:
-
+ 
+# Un seul run à la fois pour éviter les collisions de fichiers
+concurrency:
+  group: ci-ml-pipeline-${{ github.ref }}
+  cancel-in-progress: false
+ 
 jobs:
   train-and-evaluate:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 60
+ 
+    env:
+      # Seuil qualité minimal exigé (tu peux l’ajuster)
+      MIN_ACCURACY: "0.75"
+ 
     steps:
-      # Étape 1 : Récupérer le code du dépôt
       - name: Checkout repository code
         uses: actions/checkout@v4
-
-      # Étape 2 : Configurer l'environnement Python
+ 
       - name: Set up Python 3.9
         uses: actions/setup-python@v5
         with:
           python-version: '3.9'
-
-      # Étape 3 : Installer les dépendances
+          cache: 'pip'
+ 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          python -m nltk.downloader stopwords punkt wordnet
-
-      # Étape 4 : Exécuter le pipeline de données et de ML
+          # Ressources NLTK nécessaires
+          python -m nltk.downloader stopwords punkt punkt_tab wordnet omw-1.4
+ 
       - name: Run Data and ML Pipeline
         run: |
           python src/load_data.py
           python src/preprocess.py
           python src/train.py
           python src/evaluate.py
-
-      # Étape 5 : Sauvegarder les résultats MLflow comme un artefact
+ 
+      # === Partie 6 : Gouvernance & garde-fous ===
+      # Export des métriques + contrôle qualité avec seuils
+      - name: Export metrics and enforce quality gate
+        run: |
+          python - << 'PY'
+          import json, os, joblib, pandas as pd
+          from sklearn.metrics import accuracy_score, f1_score
+          # Charger test set
+          test_df = pd.read_csv(os.path.join('data','test.csv'))
+          X = test_df['text'].astype(str)
+          y = test_df['sentiment'].astype(int)
+ 
+          # Charger modèles
+          paths = {
+            "LogisticRegression": os.path.join('models','logistic_regression_pipeline.joblib'),
+            "NaiveBayes": os.path.join('models','naive_bayes_pipeline.joblib')
+          }
+          metrics = {}
+          for name, p in paths.items():
+            clf = joblib.load(p)
+            pred = clf.predict(X)
+            acc = accuracy_score(y, pred)
+            f1w = f1_score(y, pred, average='weighted')
+            metrics[name] = {"accuracy": float(acc), "f1_weighted": float(f1w)}
+ 
+          # Choisir le meilleur sur accuracy
+          best_model = max(metrics, key=lambda k: metrics[k]["accuracy"])
+          best_acc   = metrics[best_model]["accuracy"]
+ 
+          # Sauvegarder métriques
+          os.makedirs('reports', exist_ok=True)
+          with open('reports/metrics.json','w') as f:
+            json.dump({"metrics":metrics, "best_model":best_model}, f, indent=2)
+ 
+          print("=== Metrics ===")
+          print(json.dumps({"metrics":metrics, "best_model":best_model}, indent=2))
+ 
+          # Garde-fou qualité
+          min_acc = float(os.environ.get("MIN_ACCURACY","0.75"))
+          if best_acc < min_acc:
+            raise SystemExit(f"Quality gate failed: best accuracy={best_acc:.4f} < MIN_ACCURACY={min_acc:.4f}")
+          PY
+ 
+      # Artefacts utiles pour traçabilité
       - name: Upload MLflow results
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          # Nom de l
+          name: mlflow-results
+          path: mlruns/
+          compression-level: 6
+ 
+      - name: Upload trained models
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trained-models
+          path: models/
+          compression-level: 6
+ 
+      - name: Upload metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: metrics
+          path: reports/metrics.json
